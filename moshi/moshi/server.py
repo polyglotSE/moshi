@@ -173,7 +173,11 @@ class ServerState:
             log("info", "connection closed")
 
     async def handle_chat(self, request):
-        ws = web.WebSocketResponse()
+        ws = web.WebSocketResponse(
+            heartbeat=60,
+            autoping=True,         # Auto-respond to pings
+            timeout=120,
+        )
         await ws.prepare(request)
 
         log("info", "accepted connection")
