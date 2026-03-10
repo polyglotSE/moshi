@@ -23,6 +23,7 @@ import torch
 from .client_utils import log
 from .models import loaders, MimiModel, LMModel, LMGen
 from .run_inference import get_condition_tensors
+import uuid
 
 
 def seed_all(seed):
@@ -46,6 +47,8 @@ class ServerState:
 
     def __init__(self, model_type: str, mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, cfg_coef: float, device: str | torch.device, **kwargs):
+        self.model_pcm_chunks = None
+        self.user_pcm_chunks = None
         self.model_type = model_type
         self.mimi = mimi
         self.text_tokenizer = text_tokenizer
@@ -71,6 +74,21 @@ class ServerState:
 
         torch.cuda.synchronize()
 
+    def _save_session(self):
+        session_id = f"{time.time_ns()}_{uuid.uuid4().hex[:12]}"
+        save_dir = "/workspace/sessions"
+        os.makedirs(save_dir, exist_ok=True)
+
+        if self.user_pcm_chunks:
+            user_audio = np.concatenate(self.user_pcm_chunks)
+            sphn.write_wav(f"{save_dir}/{session_id}_user.wav", user_audio, int(self.mimi.sample_rate))
+
+        if self.model_pcm_chunks:
+            model_audio = np.concatenate(self.model_pcm_chunks)
+            sphn.write_wav(f"{save_dir}/{session_id}_model.wav", model_audio, int(self.mimi.sample_rate))
+
+        log("info", f"Session saved: {save_dir}/{session_id}")
+
     async def decode_and_send(
         self,
         tokens: torch.Tensor,
@@ -80,6 +98,7 @@ class ServerState:
         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
         main_pcm = self.mimi.decode(tokens[:, 1:])
         main_pcm = main_pcm.cpu()
+        self.model_pcm_chunks.append(main_pcm[0, 0].numpy().copy())
         opus_bytes = opus_writer.append_pcm(main_pcm[0, 0].numpy())
         if len(opus_bytes) > 0:
             await ws.send_bytes(b"\x01" + opus_bytes)
@@ -120,6 +139,8 @@ class ServerState:
                 if kind == 1:  # audio
                     payload = message[1:]
                     pcm = opus_reader.append_bytes(payload)
+                    if pcm.shape[-1] > 0:
+                        self.user_pcm_chunks.append(pcm.copy())
                     if pcm.shape[-1] == 0:
                         continue
                     if all_pcm_data is None:
@@ -160,11 +181,18 @@ class ServerState:
         async with self.lock:
             opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
             opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
+
+            self.user_pcm_chunks = []
+            self.model_pcm_chunks = []
+
             self.mimi.reset_streaming()
             self.lm_gen.reset_streaming()
             # Send the handshake.
             await ws.send_bytes(b"\x00")
             await self.recv_loop(ws, opus_reader, opus_writer)
+
+            self._save_session()
+
         log("info", "done with connection")
         return ws
 
